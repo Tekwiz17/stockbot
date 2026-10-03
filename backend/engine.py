@@ -33,8 +33,8 @@ class Engine:
         if rid is None:raise ValueError(provider+' local quota reached')
         try:
             r=await self.http.request(method,url,**kwargs)
-            if r.status_code in (402,429,401,403):
-                wait=86400 if r.status_code in (401,403) else max(600,int(r.headers.get('Retry-After','3600')))
+            if r.status_code in (402,429,401,403,422):
+                wait=86400 if r.status_code in (401,403,422) else max(600,int(r.headers.get('Retry-After','3600')))
                 self.s.set('cooldown_'+provider,now()+wait)
             r.raise_for_status();self.s.complete(rid,'ok');return r.json()
         except Exception:self.s.complete(rid,'failed');raise
@@ -46,7 +46,7 @@ class Engine:
         if not priced:
             r=await self.http.get('https://openrouter.ai/api/v1/models');r.raise_for_status()
             ids={m['id'] for m in models};priced={m['id']:m for m in r.json()['data'] if m['id'] in ids and m.get('pricing')}
-        preferred=['qwen/qwen3-235b-a22b','deepseek/deepseek-chat-v3-0324','qwen/qwen3-32b','google/gemini-2.5-flash-lite','google/gemini-2.5-flash']
+        preferred=['deepseek/deepseek-v4-pro','deepseek/deepseek-v4.1-flash','deepseek/deepseek-v4-flash','deepseek/deepseek-v3.2','qwen/qwen3-235b-a22b','deepseek/deepseek-chat-v3-0324','qwen/qwen3-32b','google/gemini-2.5-flash-lite','google/gemini-2.5-flash']
         candidates=[]
         for mid in preferred:
             m=priced.get(mid)
@@ -55,9 +55,11 @@ class Engine:
             try:
                 ip,op,request=map(float,(p['prompt'],p['completion'],p.get('request',0)))
                 if any(not math.isfinite(v) or v<0 for v in (ip,op,request)):continue
-                if any(float(p.get(k,0) or 0)>0 for k in ('web_search','internal_reasoning')):continue
                 # Worst-case input byte bound is 12,000; reserve for output, message overhead and a 20% margin.
-                worst=(14000*ip+1800*op+request)*1.20
+                # Explicit routing caps cover provider variation observed in a live completion.
+                if ip>0.22e-6 or op>2.7e-6 or request>0:continue
+                ip,op=0.22e-6,2.7e-6
+                worst=(14000*ip+1800*op)*1.20
                 if worst<=0.01:candidates.append((preferred.index(mid),{'id':mid,'input':ip,'output':op,'request':request,'worst':worst}))
             except (ValueError,KeyError,TypeError):continue
         if not candidates:raise ValueError('No approved model with verified affordable live pricing; AI calls suspended')
@@ -97,13 +99,18 @@ class Engine:
     async def decide(self,news,opened):
         m=await self.select_model();raw=self.context(news,opened)
         # Reserve the complete worst-case charge BEFORE sending. Keep it reserved even on timeouts.
+        if now()<self.s.get('cooldown_ai'):raise ValueError('AI is cooling down')
         rid=self.s.reserve('ai',cost=m['worst'],cap=42)
         if rid is None:raise ValueError('AI daily budget reserved; waiting for next allowance')
-        if now()<self.s.get('cooldown_ai'):self.s.complete(rid,'cooldown');raise ValueError('AI is cooling down')
         try:
-            r=await self.http.post(AI+'/chat/completions',headers={'Authorization':'Bearer '+os.environ['HACKCLUB_AI_KEY']},json={'model':m['id'],'messages':[{'role':'system','content':PROMPT},{'role':'user','content':raw}],'max_tokens':1800,'temperature':0.65,'response_format':{'type':'json_object'},'reasoning':{'enabled':False}})
-            if r.status_code in (402,429,401,403):self.s.set('cooldown_ai',now()+(86400 if r.status_code in (401,403) else 3600))
+            r=await self.http.post(AI+'/chat/completions',headers={'Authorization':'Bearer '+os.environ['HACKCLUB_AI_KEY']},json={'provider':{'max_price':{'prompt':m['input']*1e6,'completion':m['output']*1e6,'request':0},'sort':'price'},'model':m['id'],'messages':[{'role':'system','content':PROMPT},{'role':'user','content':raw}],'max_tokens':1800,'temperature':0.65,'response_format':{'type':'json_object'},'reasoning':{'enabled':False}})
+            if r.status_code in (402,429,401,403,422):self.s.set('cooldown_ai',now()+(86400 if r.status_code in (401,403,422) else 3600))
             r.raise_for_status();data=r.json();self.s.complete(rid,'ok')
+            actual=float(data.get('usage',{}).get('cost',0) or 0)
+            if not math.isfinite(actual) or actual>m['worst']:
+                if math.isfinite(actual):self.s.db.execute('UPDATE requests SET cost=? WHERE id=?',(actual,rid))
+                self.s.set('cooldown_ai',now()+86400)
+                raise ValueError('Provider cost exceeded reservation; AI calls suspended')
             payload=data['choices'][0]['message']['content'].strip()
             if payload.startswith('```'):payload=payload.split('\n',1)[1].rsplit('```',1)[0]
             obj=json.loads(payload)
@@ -167,7 +174,7 @@ class Engine:
             except Exception:self.stream_ready=False
             await asyncio.sleep(delay);delay=min(300,delay*2)
     async def loop(self):
-        next_cycle=0;last_snapshot=0
+        next_cycle=self.s.get('last_cycle')+600;last_snapshot=0
         while self.running:
             try:
                 self.s.set('phase',self.phase())

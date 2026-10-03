@@ -97,7 +97,7 @@ class Store:
         a=self.account();self.db.execute('INSERT INTO equity(ts,equity,cash) VALUES (?,?,?)',(now(),a['equity'],a['cash']))
     def prune(self):
         # Retain 14 days of minute quote records; trades and decision notes are permanent.
-        self.db.execute('DELETE FROM prices WHERE ts<?',(now()-14*86400,))
+        self.db.execute('DELETE FROM prices WHERE ts<? AND id NOT IN (SELECT id FROM prices WHERE (symbol,ts) IN (SELECT symbol,MAX(ts) FROM prices GROUP BY symbol))',(now()-14*86400,))
         self.db.execute('DELETE FROM auth_attempts WHERE ts<?',(now()-86400,))
     def public(self):
         a=self.account()

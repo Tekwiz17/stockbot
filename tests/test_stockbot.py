@@ -94,3 +94,21 @@ def test_no_alpaca_order_or_account_api_in_source():
     from pathlib import Path
     text=Path('backend/engine.py').read_text();assert 'paper-api.alpaca' not in text;assert '/orders' not in text;assert '/positions' not in text
     assert len(SYMBOLS)==30
+
+def test_unexpected_provider_cost_stops_future_ai_calls(store,monkeypatch):
+    monkeypatch.setenv('HACKCLUB_AI_KEY','test')
+    async def scenario():
+        e=Engine(store);calls=[]
+        async def handler(req):
+            if req.url.path.endswith('/models'):return httpx.Response(200,json={'data':[{'id':'deepseek/deepseek-v4-pro','pricing':{'prompt':'0.0000002088','completion':'0.0000004176'}}]})
+            body=json.loads(req.content);assert body['provider']['max_price']['completion']==2.7
+            calls.append(req)
+            return httpx.Response(200,json={'usage':{'cost':0.02},'choices':[{'message':{'content':'{"actions":[]}'}}]})
+        await e.http.aclose();e.http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with pytest.raises(ValueError):await e.decide([],False)
+        assert store.get('cooldown_ai')>now()
+        assert store.rows("SELECT cost FROM requests WHERE provider='ai'")[0]['cost']==.02
+        with pytest.raises(ValueError):await e.decide([],False)
+        assert len(calls)==1
+        await e.close()
+    asyncio.run(scenario())
