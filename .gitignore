@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db*
+.venv/
+__pycache__/
+.pytest_cache/
+.vercel/
+node_modules/
+*.pem
+*.key
+.vercel
