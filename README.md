@@ -47,7 +47,7 @@ bash deploy/install-nest.sh
 
 The installer asks privately for the supplied provider credentials and admin passcode; it generates a session secret. Choose the requested passcode in that private prompt. It writes `.env` with permissions 0600 and runs a **single** Uvicorn worker under systemd. Secrets belong on Nest because Nest makes provider calls; putting them only in Vercel would not configure the worker. No credential is bundled in this public repository.
 
-In the [Nest dashboard](https://dashboard.hackclub.app), add a reverse-proxy domain **stockbot.tekwiz17.hackclub.app**, pointing to the container's port **8765**. The worker binds `::` for Nest's IPv6 proxy. Verify `https://stockbot.tekwiz17.hackclub.app/api/health` reports `configured: true`. Nonroot containers using user systemd need lingering enabled so the worker survives logout; root containers use system-wide systemd.
+In the [Nest dashboard](https://dashboard.hackclub.app), add a reverse-proxy domain **stockbot.tekwiz17.hackclub.app**, pointing to the container's port **8765**. The worker explicitly enables a dual-stack IPv4/IPv6 socket for Nest's proxy. Verify `https://stockbot.tekwiz17.hackclub.app/api/health` reports `configured: true`. Nonroot containers using user systemd need lingering enabled so the worker survives logout; root containers use system-wide systemd.
 
 Import `Tekwiz17/stockbot` into Vercel as an **Other** project. Output directory: **public**. No build command or dependency install is needed. `vercel.json` reverse-proxies `/api/*` to Nest and routes `/admin` to the controls page. Set the exact Vercel production origin in Nest's `PUBLIC_ORIGINS`; login/control POSTs reject other origins. Redeploy the frontend if the backend domain changes. Vercel needs no provider API keys because it only serves assets and forwards requests.
 
@@ -76,3 +76,13 @@ Open http://127.0.0.1:8765. Local login testing additionally needs `ADMIN_PASSCO
 This is an experiment, not a brokerage or investment recommendation. It does not model commissions, taxes, dividends, splits, corporate actions, liquidity, market impact or trading halts. A split can distort raw price-based returns until corporate-action accounting is added. IEX is not a consolidated all-exchange quote. The fixed stream universe limits discovery to 30 names. Model notes provide feedback memory, not trained model-weight updates. There is no proof of profitability and no promise of a minimum trade count.
 
 Provider references: [Alpaca market data plans](https://docs.alpaca.markets/us/docs/about-market-data-api), [Hack Club AI docs](https://docs.ai.hackclub.com/), [Hack Club Search docs](https://search.hackclub.com/docs), [Nest quickstart](https://guides.hackclub.app/index.php/Quickstart).
+
+## Update an existing Nest installation
+
+```sh
+cd /root/stockbot
+git pull --ff-only
+bash deploy/install-nest.sh
+```
+
+The installer preserves provider credentials and the database, adds `https://stockbot.tekwiz17.me` to allowed origins, rewrites the service to use `backend.serve`, and restarts it. This fixes the IPv6-only listener that may prevent an IPv4 reverse-proxy connection. Verify locally using both `http://127.0.0.1:8765/api/health` and `http://[::1]:8765/api/health`.

@@ -11,7 +11,7 @@ fields={
  'HACKCLUB_SEARCH_KEY':getpass.getpass('Hack Club Search key: '),
  'ADMIN_PASSCODE':getpass.getpass('Admin passcode: '),
  'SESSION_SECRET':secrets.token_hex(32),
- 'PUBLIC_ORIGINS':input('Vercel production origin (https://your-project.vercel.app): ').strip()+',https://stockbot.tekwiz17.hackclub.app',
+ 'PUBLIC_ORIGINS':(input('Vercel production origin [https://stockbot.tekwiz17.me]: ').strip() or 'https://stockbot.tekwiz17.me')+',https://stockbot.tekwiz17.hackclub.app',
  'STOCKBOT_DB':str(Path.cwd()/'data/stockbot.sqlite3'),
 }
 if any(not v for v in fields.values()):raise SystemExit('All values are required; configuration was not saved.')

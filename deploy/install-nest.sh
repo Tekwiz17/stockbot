@@ -6,6 +6,7 @@ STOCKBOT_DIR="$(pwd)"
 python3 -m venv .venv
 .venv/bin/python -m pip install -r backend/requirements.txt
 python3 deploy/configure.py
+python3 deploy/update-origins.py
 mkdir -p data
 chmod 700 data
 chmod 600 .env
@@ -28,7 +29,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$STOCKBOT_DIR
 EnvironmentFile=$STOCKBOT_DIR/.env
-ExecStart=$STOCKBOT_DIR/.venv/bin/python -m uvicorn backend.app:app --host :: --port 8765 --workers 1 --no-access-log
+ExecStart=$STOCKBOT_DIR/.venv/bin/python -m backend.serve
 Restart=on-failure
 RestartSec=15
 UMask=0077
@@ -39,6 +40,7 @@ MemoryMax=900M
 WantedBy=$STOCKBOT_TARGET
 EOF
 "${STOCKBOT_SYSTEMCTL[@]}" daemon-reload
-"${STOCKBOT_SYSTEMCTL[@]}" enable --now stockbot.service
+"${STOCKBOT_SYSTEMCTL[@]}" enable stockbot.service
+"${STOCKBOT_SYSTEMCTL[@]}" restart stockbot.service
 "${STOCKBOT_SYSTEMCTL[@]}" is-active stockbot.service
 printf '%s\n' 'Backend listening on port 8765. Configure the Nest dashboard reverse proxy for stockbot.tekwiz17.hackclub.app → port 8765.'

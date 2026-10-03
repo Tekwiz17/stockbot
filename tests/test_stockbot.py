@@ -112,3 +112,15 @@ def test_unexpected_provider_cost_stops_future_ai_calls(store,monkeypatch):
         assert len(calls)==1
         await e.close()
     asyncio.run(scenario())
+
+def test_listener_accepts_ipv4_and_ipv6():
+    import socket
+    from backend.serve import listener
+    with listener(0) as server:
+        port=server.getsockname()[1]
+        server.settimeout(2)
+        for family,address in [(socket.AF_INET,'127.0.0.1')]+([(socket.AF_INET6,'::1')] if socket.has_dualstack_ipv6() else []):
+            with socket.socket(family,socket.SOCK_STREAM) as client:
+                client.settimeout(2);client.connect((address,port))
+                connection,_=server.accept()
+                connection.close()
