@@ -43,4 +43,23 @@ EOF
 "${STOCKBOT_SYSTEMCTL[@]}" enable stockbot.service
 "${STOCKBOT_SYSTEMCTL[@]}" restart stockbot.service
 "${STOCKBOT_SYSTEMCTL[@]}" is-active stockbot.service
+if ! .venv/bin/python - <<'PYHEALTH'
+import json,time,urllib.request
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for attempt in range(30):
+    try:
+        with opener.open('http://127.0.0.1:8765/api/health',timeout=2) as response:
+            if json.load(response).get('ok'):
+                print('Backend health check passed.')
+                break
+    except (OSError,ValueError):pass
+    time.sleep(1)
+else:
+    raise SystemExit('Backend did not become healthy within 30 attempts.')
+PYHEALTH
+then
+  "${STOCKBOT_SYSTEMCTL[@]}" status stockbot.service --no-pager -l || true
+  printf '%s\n' 'Startup failed. Inspect: journalctl -u stockbot -n 60 --no-pager'
+  exit 1
+fi
 printf '%s\n' 'Backend listening on port 8765. Configure the Nest dashboard reverse proxy for stockbot.tekwiz17.hackclub.app → port 8765.'
