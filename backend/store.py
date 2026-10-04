@@ -115,11 +115,11 @@ class Store:
         trades=self.rows('SELECT * FROM trades ORDER BY id DESC LIMIT 200')
         for t in trades:
             for k in ('qty','price','amount','realized'):t[k]/=SCALE
-        eq=self.rows('SELECT ts,equity,cash FROM equity ORDER BY id DESC LIMIT 2500')[::-1]
+        count=self.db.execute('SELECT COUNT(*) FROM equity').fetchone()[0]
+        stride=max(1,(count+1999)//2000)
+        eq=self.rows('SELECT ts,equity,cash FROM equity WHERE id % ?=0 OR id IN (SELECT MIN(id) FROM equity UNION SELECT MAX(id) FROM equity) OR ts>? ORDER BY ts',(stride,now()-86400))
         for e in eq:e['equity']/=SCALE;e['cash']/=SCALE
         stats=self.rows('SELECT provider,COUNT(*) calls,COALESCE(SUM(cost),0) reserved FROM requests WHERE ts>? GROUP BY provider',(now()-86400,))
         realized=self.db.execute('SELECT COALESCE(SUM(realized),0) FROM trades').fetchone()[0]/SCALE
-        from .universe import SYMBOLS
-        weights={p['symbol']:p['value']/a['equity'] if a['equity'] else 0 for p in a['holdings']}
-        stock_risks={symbol:self.risk(symbol,weights.get(symbol,0)) for symbol in SYMBOLS}
+        stock_risks={p['symbol']:p['risk'] for p in a['holdings']}
         return {**a,'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':0.45,'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}

@@ -178,3 +178,30 @@ def test_sparse_risk_quotes_not_manufactured_into_volatility():
     from backend.risk import calculate
     stamp=now();rows=[{'ts':stamp-i*86400,'bid':100*SCALE,'ask':101*SCALE} for i in range(40)][::-1]
     assert calculate(rows,rows[-1],.1,stamp)['score'] is None
+
+def test_dynamic_ticker_and_holdings_only_risk(store):
+    async def run():
+        e=Engine(store);e.market_open=lambda stamp=None:True
+        async def prices(symbols=None):
+            assert symbols==['IBM'];quote(store,'IBM')
+        e.fallback_quotes=prices
+        obj={'actions':[{'symbol':'IBM','side':'buy','quantity':2,'reason':'Independent earnings thesis'}]}
+        await e.prepare_actions(obj,True);e.apply(obj,True)
+        assert set(store.public()['stock_risks'])=={'IBM'}
+        assert 'IBM' in e.tracked_symbols()
+        store.fill('exit','IBM','sell',2,'Close thesis',True)
+        assert store.public()['stock_risks']=={}
+        await e.close()
+    asyncio.run(run())
+
+def test_closed_market_discovery_never_fetches_or_trades(store):
+    async def run():
+        e=Engine(store)
+        async def forbidden(*args):raise AssertionError('No closed-market execution quotes')
+        e.fallback_quotes=forbidden
+        obj={'actions':[{'symbol':'IBM','side':'buy','quantity':2,'reason':'Independent thesis'}],'plan':{'summary':'Watch IBM','why':'Earnings catalyst','watchlist':[{'symbol':'IBM','condition':'Breakout'}]}}
+        await e.prepare_actions(obj,False);e.apply(obj,False)
+        assert store.get('plan')['watchlist'][0]['symbol']=='IBM'
+        assert store.public()['trade_count']==0
+        await e.close()
+    asyncio.run(run())
