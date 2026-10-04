@@ -124,3 +124,57 @@ def test_listener_accepts_ipv4_and_ipv6():
                 client.settimeout(2);client.connect((address,port))
                 connection,_=server.accept()
                 connection.close()
+
+@pytest.mark.parametrize('value,seconds',[('2m59.56s',179.56),('7.66s',7.66),('1h2m3s',3723),('500ms',.5),('60',60)])
+def test_reset_header_durations(value,seconds):
+    from backend.limits import reset_time
+    assert reset_time(value,1000)==pytest.approx(1000+seconds)
+
+def test_header_cooldown_and_persistence(store):
+    from backend.limits import capture,reset_time
+    stamp=now()
+    assert reset_time('nonsense',stamp) is None
+    assert reset_time('1791040000000',stamp)==1791040000
+    capture(store,'ai',httpx.Response(200,headers={'x-ratelimit-reset-requests':'1h','x-ratelimit-reset-tokens':'7.66s','x-ratelimit-remaining-requests':'40','x-ratelimit-remaining-tokens':'0'}),stamp)
+    assert store.get('cooldown_ai')==pytest.approx(stamp+8.66)
+    assert store.get('limits_ai')['requests_reset_at']==stamp+3600
+    assert 'credit_retry_at' not in store.get('limits_ai')
+    reopened=Store(store.db.execute('PRAGMA database_list').fetchone()[2]);assert reopened.get('limits_ai')['tokens_reset_at']==pytest.approx(stamp+7.66)
+
+def test_credit_failure_keeps_spending_budget(store):
+    from backend.limits import capture
+    store.reserve('ai',.01)
+    capture(store,'ai',httpx.Response(402,headers={'x-ratelimit-reset-tokens':'2s'}),now())
+    assert store.get('cooldown_ai')>now()+2
+    assert store.rows("SELECT cost FROM requests WHERE provider='ai'")[0]['cost']==.01
+    assert 'fallback' in store.get('limits_ai')['credit_retry_source']
+
+def test_weekend_plan_does_not_execute_and_strategy_is_persisted(store):
+    quote(store);e=Engine(store);e.market_open=lambda stamp=None:False
+    obj={'title':'Monday plan','note':'Review catalysts','strategy':{'name':'Defensive swing','why':'Uncertain catalysts','horizon':'swing'},'plan':{'summary':'Wait for confirmation','why':'No valid weekend prices','watchlist':[{'symbol':'NVDA','condition':'Breaks resistance','why':'Momentum','invalidation':'Falls below support'}],'steps':['Recheck quotes after opening']},'actions':[{'symbol':'NVDA','side':'buy','quantity':10,'reason':'Ignore weekend restriction'}]}
+    e.apply(obj,False)
+    assert store.public()['trade_count']==0;assert store.public()['strategy']=='Defensive swing'
+    assert store.public()['plan']['watchlist'][0]['condition']=='Breaks resistance'
+    assert 'saved_plan' in json.loads(e.context([],True))
+    asyncio.run(e.close())
+
+def test_risk_unknown_until_sufficient_samples_and_more_movement_is_riskier():
+    from backend.risk import calculate
+    stamp=now()
+    def rows(amplitude):return [{'ts':stamp-(40-i)*60,'bid':int((100+amplitude*(i%2))*SCALE),'ask':int((100.01+amplitude*(i%2))*SCALE)} for i in range(40)]
+    calm=rows(.01);volatile=rows(2)
+    assert calculate(calm[:3],calm[-1],.1,stamp)['score'] is None
+    low=calculate(calm,calm[-1],.1,stamp);high=calculate(volatile,volatile[-1],.1,stamp)
+    assert 0<=low['score']<high['score']<=100
+    assert high['samples']==39
+
+def test_429_uses_exhausted_token_reset_not_unexhausted_request_window(store):
+    from backend.limits import capture
+    stamp=now()
+    capture(store,'ai',httpx.Response(429,headers={'x-ratelimit-reset-requests':'1d','x-ratelimit-remaining-requests':'20','x-ratelimit-reset-tokens':'9s','x-ratelimit-remaining-tokens':'0','retry-after':'2'}),stamp)
+    assert store.get('cooldown_ai')==pytest.approx(stamp+10)
+
+def test_sparse_risk_quotes_not_manufactured_into_volatility():
+    from backend.risk import calculate
+    stamp=now();rows=[{'ts':stamp-i*86400,'bid':100*SCALE,'ask':101*SCALE} for i in range(40)][::-1]
+    assert calculate(rows,rows[-1],.1,stamp)['score'] is None

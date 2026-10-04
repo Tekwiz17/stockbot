@@ -6,15 +6,15 @@ The frontend is static on Vercel. One continuously running Python process on Hac
 
 ## Deployment status
 
-Source and tests are ready. The backend has **not** been installed or started on Nest: the build workspace could not reach SSH (DNS failure / no IPv6 route). A temporary Vercel design preview was deployed on October 3, 2026; it requires claiming to become permanent. There are no live trades or fabricated preview balances. The Nest domain in `vercel.json` is the planned address, not a verified active service.
+The base experiment was verified running on Nest and serving the public dashboard on October 3, 2026 at https://stockbot.tekwiz17.me. Code changes must be pulled and restarted on Nest; Vercel must deploy the latest repository commit for frontend changes. The coding workspace cannot resolve the SSH host, so direct server deployment from it is unavailable.
 
 ## Behavior
 
 - During the XNYS regular session, deliberates about every ten minutes; up to six independent actions per cycle. An active full session permits roughly 39 deliberations, potentially hundreds of fills including AI-planned stop losses and profit targets.
-- Aggressive catalyst and momentum mandate, targeting 70–95% exposure across multiple names. This is a policy given to the model, not a guarantee it always trades or makes money. A model may hold when evidence is insufficient.
+- The AI chooses and revises its own strategy, holding horizon, risk appetite and cash allocation from evidence. It is not required to remain aggressive or invest for the long term. The dashboard shows its chosen approach and explanation.
 - Holds long stocks and ETFs, supports microshare precision, a $10 minimum fill, no leverage or shorting, and a 30% single-position maximum.
 - Uses ask plus 5 bps to buy and bid minus 5 bps to sell. Quotes must be no more than 90 seconds old with a valid spread under 2%. A fill is atomic and cannot overdraft cash or sell unowned shares. These are simplified simulated fills, without actual liquidity/queue modeling.
-- Studies realized outcomes by symbol, recent trade theses and prior notes before each decision. Closed sessions—including holidays and weekends—get one reflection per New York calendar day after 10 AM. Market holidays and half-days use `exchange-calendars`.
+- Studies realized outcomes by symbol, recent trade theses and prior notes before each decision. Closed sessions—including holidays and weekends—get one conditional next-session plan per New York calendar day after 10 AM, with rationale, watchlist, entry conditions and invalidation signals. Closed-market plans cannot execute trades and are reassessed with fresh data after opening. Market holidays and half-days use `exchange-calendars`.
 - Streams a curated universe of 30 US stocks/ETFs through IEX, compatible with Alpaca Basic. Stores quote samples every 15 seconds per symbol, retains 14 days of samples, and permanently retains fills and decisions. Uses a batched REST quote fallback only when needed.
 - A pause suspends execution (including planned exits), research and streams. A stop is permanent through the app and preserves holdings without forced liquidation. Restarting the server preserves state.
 
@@ -86,3 +86,9 @@ bash deploy/install-nest.sh
 ```
 
 The installer preserves provider credentials and the database, adds `https://stockbot.tekwiz17.me` to allowed origins, rewrites the service to use `backend.serve`, and restarts it. This fixes the IPv6-only listener that may prevent an IPv4 reverse-proxy connection. Verify locally using both `http://127.0.0.1:8765/api/health` and `http://[::1]:8765/api/health`.
+
+## Reset headers, planning and risk (October 4 update)
+
+Every budgeted provider response records `x-ratelimit-reset-requests` and `x-ratelimit-reset-tokens` when supplied, including successful responses and rate-limit errors. Durations (`2m59.56s`, milliseconds), epoch seconds/milliseconds, ISO timestamps and HTTP dates are accepted. Exhausted limits and `Retry-After` control persistent cooldowns. The dashboard displays reported reset times, or “not reported.” These headers describe request/token limits; they are not evidence of a dollar-credit replenishment time. On HTTP 402 without explicit credit-reset metadata, the next UTC day is a labeled retry fallback. Reset headers never clear StockBot's independent rolling $0.45 reservations.
+
+The Stock risk tab covers all 30 watched symbols and holdings have a risk column. At least 20 valid observed one-minute returns are needed. The 0–100 heuristic weights volatility (45 points), observed drawdown (25), bid/ask spread (15), and portfolio concentration (15). Components saturate at an 8% daily volatility proxy, 10% drawdown, 0.5% spread and 30% portfolio weight. It is a transparent local indicator, not a probability of losing money, a trained risk model or a stock recommendation. Overnight gaps are excluded from volatility samples, and stale measurements are labeled. Until market quote history accumulates, risk reads “Insufficient data.” No additional AI or market-data requests are made to calculate scores.
