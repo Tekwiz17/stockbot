@@ -205,3 +205,56 @@ def test_closed_market_discovery_never_fetches_or_trades(store):
         assert store.public()['trade_count']==0
         await e.close()
     asyncio.run(run())
+
+def test_minute_bars_and_factual_context(store):
+    async def run():
+        e=Engine(store);quote(store,'NVDA')
+        store.bar('NVDA',100,102,99,101,45,now()-60)
+        store.bar('NVDA',100,99,101,100,45,now())
+        c=json.loads(e.context([],True))
+        assert c['trade_count']==0
+        q=next(q for q in c['quotes'] if q['symbol']=='NVDA')
+        assert len(q['minute_bars'])==1 and q['minute_bars'][0]['volume']==45
+        await e.close()
+    asyncio.run(run())
+
+def test_safe_detailed_failure_records(store):
+    async def run():
+        e=Engine(store);e.cycle_stage='AI decision'
+        e.record_failure(ValueError('Context exceeds safe input limit'))
+        assert 'Context exceeds' in store.get('last_error')
+        e.record_failure(ValueError('SECRET_TOKEN_FROM_PROVIDER'))
+        assert 'SECRET' not in store.get('last_error')
+        assert 'SECRET' not in str(store.rows('SELECT * FROM cycle_errors'))
+        await e.close()
+    asyncio.run(run())
+
+def test_stream_subscription_includes_bars(store):
+    async def run():
+        e=Engine(store);messages=[]
+        class WS:
+            async def send(self,message):messages.append(json.loads(message))
+        e.ws=WS();await e.sync_subscription()
+        assert messages[0]['bars']==messages[0]['quotes']
+        assert len(messages[0]['bars'])<=30
+        await e.close()
+    asyncio.run(run())
+
+def test_55_cent_budget_and_57_completion_cap(store):
+    for _ in range(57):assert store.reserve('ai',cost=.009528,cap=57)
+    assert store.reserve('ai',cost=.009528,cap=57) is None
+    assert store.public()['ai_budget']==.55
+    assert store.public()['usage'][0]['reserved']<=.55
+
+def test_full_bar_context_stays_inside_input_budget(store):
+    async def run():
+        e=Engine(store)
+        for symbol in SYMBOLS:
+            quote(store,symbol)
+            for i in range(5):store.bar(symbol,100,102,99,101,10000,now()-60*(i+1))
+        raw=e.context([],True)
+        from backend.engine import PROMPT
+        assert len((PROMPT+raw).encode())<=12000
+        assert json.loads(raw)['trade_count']==0
+        await e.close()
+    asyncio.run(run())

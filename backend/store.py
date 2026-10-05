@@ -30,6 +30,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS equity(id INTEGER PRIMARY KEY,ts REAL,equity INTEGER,cash INTEGER);
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,ts REAL,provider TEXT,cost REAL,status TEXT);
         CREATE TABLE IF NOT EXISTS research(id INTEGER PRIMARY KEY,ts REAL,query TEXT,results TEXT);
+        CREATE TABLE IF NOT EXISTS cycle_errors(ts REAL,stage TEXT,kind TEXT,detail TEXT);
+        CREATE TABLE IF NOT EXISTS bars(symbol TEXT,ts REAL,open REAL,high REAL,low REAL,close REAL,volume REAL,PRIMARY KEY(symbol,ts));
         CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,ts REAL,kind TEXT,payload TEXT);
         CREATE TABLE IF NOT EXISTS auth_attempts(ts REAL,ip TEXT);
         ''')
@@ -41,7 +43,7 @@ class Store:
     def set(self,k,v): self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(k,json.dumps(v)))
     def rows(self,q,args=()): return [dict(x) for x in self.db.execute(q,args)]
     def note(self,kind,title,body): self.db.execute('INSERT INTO notes(ts,kind,title,body) VALUES (?,?,?,?)',(now(),kind,str(title)[:160],str(body)[:4000]))
-    def reserve(self,provider,cost=0,limit=0.45,cap=48,window=86400):
+    def reserve(self,provider,cost=0,limit=0.55,cap=48,window=86400):
         self.db.execute('BEGIN IMMEDIATE')
         try:
             r=self.db.execute('SELECT COUNT(*),COALESCE(SUM(cost),0) FROM requests WHERE provider=? AND ts>?',(provider,now()-window)).fetchone()
@@ -54,6 +56,12 @@ class Store:
         b,a=units(bid),units(ask)
         if not (0<b<=a) or a>b*1.02 or ts>now()+5: return
         self.db.execute('INSERT INTO prices(ts,symbol,bid,ask,source) VALUES (?,?,?,?,?)',(ts,symbol,b,a,source))
+    def bar(self,symbol,open_,high,low,close,volume,ts):
+        import math
+        values=(open_,high,low,close,volume,ts)
+        if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in values):return
+        if min(open_,high,low,close)<=0 or volume<0 or low>min(open_,close) or high<max(open_,close) or ts>now()+5:return
+        self.db.execute('INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?)',(symbol,ts,open_,high,low,close,volume))
     def latest(self,symbol):
         r=self.db.execute('SELECT * FROM prices WHERE symbol=? ORDER BY ts DESC LIMIT 1',(symbol,)).fetchone()
         return dict(r) if r else None
@@ -96,6 +104,8 @@ class Store:
     def snapshot(self):
         a=self.account();self.db.execute('INSERT INTO equity(ts,equity,cash) VALUES (?,?,?)',(now(),a['equity'],a['cash']))
     def prune(self):
+        self.db.execute('DELETE FROM bars WHERE ts<?',(now()-14*86400,))
+        self.db.execute('DELETE FROM cycle_errors WHERE ts<?',(now()-30*86400,))
         # Retain 14 days of minute quote records; trades and decision notes are permanent.
         self.db.execute('DELETE FROM prices WHERE ts<? AND id NOT IN (SELECT id FROM prices WHERE (symbol,ts) IN (SELECT symbol,MAX(ts) FROM prices GROUP BY symbol))',(now()-14*86400,))
         self.db.execute('DELETE FROM auth_attempts WHERE ts<?',(now()-86400,))
@@ -122,4 +132,4 @@ class Store:
         stats=self.rows('SELECT provider,COUNT(*) calls,COALESCE(SUM(cost),0) reserved FROM requests WHERE ts>? GROUP BY provider',(now()-86400,))
         realized=self.db.execute('SELECT COALESCE(SUM(realized),0) FROM trades').fetchone()[0]/SCALE
         stock_risks={p['symbol']:p['risk'] for p in a['holdings']}
-        return {**a,'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':0.45,'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}
+        return {**a,'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':0.55,'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}

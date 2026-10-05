@@ -15,13 +15,14 @@ function render(d){
  $('equity-foot').textContent='Marked '+stamp(d.as_of);$('pnl-foot').textContent=(d.pnl>=0?'+':'')+(d.pnl/1000).toFixed(2)+'% since inception';$('cash-foot').textContent=(d.equity?d.cash/d.equity*100:0).toFixed(1)+'% of portfolio';$('trades-foot').textContent=number(d.holdings.length)+' open positions';
  $('phase').textContent=d.phase;$('model').textContent=d.model==='pending'?'Awaiting first deliberation':d.model;$('last-cycle').textContent=stamp(d.last_cycle);
  const thought=d.notes.find(n=>n.kind==='decision'||n.kind==='reflection'||n.kind==='plan');$('latest-thought').textContent=thought?thought.body:'The agent’s first deliberation will appear here. No synthetic trades or notes are displayed.';
- const ai=d.usage.find(u=>u.provider==='ai');const reserved=ai?.reserved||0;$('budget-label').textContent='$'+reserved.toFixed(3)+' / $0.45';$('budget-fill').style.width=Math.min(100,reserved/.45*100)+'%';
+ const ai=d.usage.find(u=>u.provider==='ai');const reserved=ai?.reserved||0;const budget=d.ai_budget||.55;$('budget-label').textContent='$'+reserved.toFixed(3)+' / $'+budget.toFixed(2);$('budget-fill').style.width=Math.min(100,reserved/budget*100)+'%';
  $('position-count').textContent=d.holdings.length;
  $('strategy-name').textContent=d.strategy||'AI-selected';$('strategy-horizon').textContent=d.strategy_horizon||'Undecided';$('strategy-why').textContent=d.strategy_why||'';
  const limits=d.provider_limits?.ai||{};
- $('request-reset').textContent='Request limit resets: '+(limits.requests_reset_at?stamp(limits.requests_reset_at):'not reported');
- $('token-reset').textContent='Token limit resets: '+(limits.tokens_reset_at?stamp(limits.tokens_reset_at):'not reported');
- $('credit-reset').textContent=limits.credit_retry_at?'Credit retry: '+stamp(limits.credit_retry_at)+' ('+limits.credit_retry_source+')':'Dollar-credit reset: not reported';
+ $('request-reset').textContent='Request limit resets: '+(limits.requests_reset_at?stamp(limits.requests_reset_at):'unknown — provider did not supply header');
+ $('token-reset').textContent='Token limit resets: '+(limits.tokens_reset_at?stamp(limits.tokens_reset_at):'unknown — provider did not supply header');
+ $('credit-reset').textContent=limits.credit_retry_at?'Credit retry: '+stamp(limits.credit_retry_at)+' ('+limits.credit_retry_source+')':'Dollar-credit reset: unknown — provider did not report it';
+ $('local-budget-reset').textContent='Local rolling budget: '+(d.ai_local_budget_available_at?'earliest reservation expires '+stamp(d.ai_local_budget_available_at):'full allowance available')+'. This is separate from provider credits.';
  const plan=d.plan;
  $('session-plan').innerHTML=plan?`<h3>${escape(plan.summary)}</h3><p>${escape(plan.why)}</p><ol>${(plan.steps||[]).map(step=>`<li>${escape(step)}</li>`).join('')}</ol><div class="plan-watchlist">${(plan.watchlist||[]).map(item=>`<article><strong>${escape(item.symbol)}</strong><p><b>Watch:</b> ${escape(item.condition)}</p><p><b>Why:</b> ${escape(item.why)}</p><p><b>Invalidation:</b> ${escape(item.invalidation)}</p></article>`).join('')}</div><p class="muted">Prepared ${escape(stamp(plan.created_at))}. Every entry requires a new decision with fresh prices during market hours.</p>`:'<p class="muted">The AI will publish its plan and reasoning at its next planning cycle.</p>';
  $('risk-body').innerHTML=d.holdings.map(p=>[p.symbol,p.risk||d.stock_risks?.[p.symbol]||{}]).map(([symbol,r])=>`<tr><td class="symbol-name">${escape(symbol)}</td><td>${riskBadge(r)}</td><td>${r.daily_volatility_proxy_pct===undefined?'—':number(r.daily_volatility_proxy_pct)+'%'}</td><td>${r.observed_drawdown_pct===undefined?'—':number(r.observed_drawdown_pct)+'%'}</td><td>${r.spread_pct===undefined?'—':number(r.spread_pct)+'%'}</td><td>${r.samples}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">No open holdings. Stock risk appears when the bot buys shares.</td></tr>';
@@ -29,7 +30,7 @@ function render(d){
  document.querySelectorAll('[data-weight]').forEach(el=>el.style.width=el.dataset.weight+'%');
  $('trades-body').innerHTML=d.trades.length?d.trades.map(t=>`<tr title="${escape(t.reason)}"><td>${escape(stamp(t.ts))}</td><td><span class="side-pill ${t.side==='sell'?'sell':''}">${escape(t.side.toUpperCase())}</span></td><td class="symbol-name">${escape(t.symbol)}</td><td>${number(t.qty)}</td><td>${money(t.price)}</td><td>${money(t.amount)}</td><td class="${t.side==='sell'?sign(t.realized):'muted'}">${t.side==='sell'?money(t.realized):'—'}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">The ledger is empty. Trades appear here after independent execution.</td></tr>';
  $('notes').innerHTML=d.notes.length?d.notes.map(n=>`<article class="note-card"><div class="note-meta"><span class="note-kind">${escape(n.kind)}</span><span>${escape(stamp(n.ts))}</span></div><h3>${escape(n.title)}</h3><p>${escape(n.body)}</p></article>`).join(''):'<div class="empty">Research and reflections appear after the first decision cycle.</div>';
- $('notice').hidden=!d.last_error;$('notice').textContent='The agent deferred its latest cycle because a provider or budget guard was triggered. No trade was fabricated. '+d.last_error;
+ $('notice').hidden=!d.last_error;$('notice').textContent='The latest cycle was deferred: '+d.last_error;
  if(d.phase==='Awaiting server credentials'){$('notice').hidden=false;$('notice').textContent='The frontend is ready. The Nest backend needs its private credentials before the experiment can begin.';}
  chart();
 }
