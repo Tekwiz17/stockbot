@@ -399,3 +399,42 @@ def test_extra_keys_do_not_bypass_429(store,monkeypatch):
         assert seen==['one'] and store.get('cooldown_alpaca')>now()
         await e.close()
     asyncio.run(run())
+
+def test_two_ai_keys_independent_limits_preserve_existing_usage(store,monkeypatch):
+    monkeypatch.setenv('HACKCLUB_AI_KEY','first');monkeypatch.setenv('HACKCLUB_AI_KEY_2','second')
+    store.reserve('ai',.30)
+    async def run():
+        e=Engine(store);pairs=e.ai_credentials()
+        assert len(pairs)==2
+        assert store.ai_budgets()[0]['reserved']==.30
+        for _ in range(57):
+            try:e.reserve_ai(.009528)
+            except ValueError:break
+        assert len(store.ai_budgets())==2
+        assert store.public()['ai_budget']==1.10
+        assert all(b['reserved']<=.55 for b in store.ai_budgets())
+        assert store.ai_budgets()[1]['calls']>0
+        assert ': "first"' not in json.dumps(store.public()) and ': "second"' not in json.dumps(store.public())
+        await e.close()
+    asyncio.run(run())
+
+def test_duplicate_ai_key_does_not_double_allowance(store,monkeypatch):
+    monkeypatch.setenv('HACKCLUB_AI_KEY','same');monkeypatch.setenv('HACKCLUB_AI_KEY_2','same')
+    async def run():
+        e=Engine(store);assert len(e.ai_credentials())==1
+        assert store.public()['ai_budget']==.55
+        await e.close()
+    asyncio.run(run())
+
+def test_scoped_ai_credit_cooldown_and_global_request_cooldown(store,monkeypatch):
+    from backend.limits import capture
+    monkeypatch.setenv('HACKCLUB_AI_KEY','first');monkeypatch.setenv('HACKCLUB_AI_KEY_2','second')
+    async def run():
+        e=Engine(store);first=e.ai_credentials()[0][0]
+        capture(store,'ai',httpx.Response(402,headers={'x-credit-reset-at':'1h'}),now(),scope=first)
+        assert store.get('cooldown_ai')==0
+        rid,ident,key=e.reserve_ai(.01);assert key=='second'
+        capture(store,'ai',httpx.Response(429,headers={'retry-after':'60'}),now(),scope=ident)
+        assert store.get('cooldown_ai')>now()
+        await e.close()
+    asyncio.run(run())

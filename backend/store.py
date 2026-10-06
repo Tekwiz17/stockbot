@@ -38,6 +38,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,ts REAL,kind TEXT,payload TEXT);
         CREATE TABLE IF NOT EXISTS auth_attempts(ts REAL,ip TEXT);
         ''')
+        if 'credential' not in {r[1] for r in self.db.execute('PRAGMA table_info(requests)')}:
+            self.db.execute('ALTER TABLE requests ADD COLUMN credential TEXT')
         for k,v in {'cash':INITIAL,'status':'running','model':'pending','phase':'Connecting','last_cycle':0,'last_error':'','last_stream':0,'collection_error':'','start_not_before':0,'last_reflection':'','strategy':'AI choosing strategy','strategy_why':'Awaiting the next autonomous decision','strategy_horizon':'Undecided','plan':None,'plan_version':0,'last_plan':'','cooldown_ai':0,'cooldown_search':0,'cooldown_alpaca':0}.items():
             self.db.execute('INSERT OR IGNORE INTO state VALUES (?,?)',(k,json.dumps(v)))
         if not self.db.execute("SELECT 1 FROM state WHERE key='history_migrated'").fetchone():
@@ -50,12 +52,15 @@ class Store:
     def set(self,k,v): self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(k,json.dumps(v)))
     def rows(self,q,args=()): return [dict(x) for x in self.db.execute(q,args)]
     def note(self,kind,title,body): self.db.execute('INSERT INTO notes(ts,kind,title,body) VALUES (?,?,?,?)',(now(),kind,str(title)[:160],str(body)[:4000]))
-    def reserve(self,provider,cost=0,limit=0.55,cap=48,window=86400):
+    def reserve(self,provider,cost=0,limit=0.55,cap=48,window=86400,credential=None):
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            r=self.db.execute('SELECT COUNT(*),COALESCE(SUM(cost),0) FROM requests WHERE provider=? AND ts>?',(provider,now()-window)).fetchone()
+            query='SELECT COUNT(*),COALESCE(SUM(cost),0) FROM requests WHERE provider=? AND ts>?'
+            args=(provider,now()-window)
+            if credential is not None:query+=' AND credential=?';args+=(credential,)
+            r=self.db.execute(query,args).fetchone()
             if r[0]>=cap or r[1]+cost>limit: self.db.execute('ROLLBACK');return None
-            c=self.db.execute('INSERT INTO requests(ts,provider,cost,status) VALUES (?,?,?,?)',(now(),provider,cost,'reserved'))
+            c=self.db.execute('INSERT INTO requests(ts,provider,cost,status,credential) VALUES (?,?,?,?,?)',(now(),provider,cost,'reserved',credential))
             self.db.execute('COMMIT');return c.lastrowid
         except BaseException: self.db.execute('ROLLBACK');raise
     def complete(self,rid,status): self.db.execute('UPDATE requests SET status=? WHERE id=?',(status,rid))
@@ -123,6 +128,17 @@ class Store:
         for row in raw:buckets.setdefault(int(row['ts']//60),row)
         rows=list(buckets.values())[:390][::-1]
         return calculate(rows,self.latest(symbol),weight,now())
+    def ai_budgets(self):
+        row=self.db.execute("SELECT value FROM state WHERE key='ai_key_ids'").fetchone()
+        ids=json.loads(row[0]) if row else [None]
+        budgets=[]
+        for index,credential in enumerate(ids):
+            usage=self.db.execute("SELECT COUNT(*),COALESCE(SUM(cost),0),MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>? AND credential IS ?",(now()-86400,credential)).fetchone()
+            cooldown_key='cooldown_ai_'+str(credential)
+            cooldown=self.db.execute('SELECT value FROM state WHERE key=?',(cooldown_key,)).fetchone()
+            limits=self.db.execute('SELECT value FROM state WHERE key=?',('limits_ai_'+str(credential),)).fetchone()
+            budgets.append({'provider_limits':json.loads(limits[0]) if limits else {},'label':'AI key '+str(index+1),'budget':.55,'buffer':.05,'reserved':usage[1],'calls':usage[0],'next_reservation_expires':usage[2],'cooldown_until':json.loads(cooldown[0]) if cooldown else 0})
+        return budgets
     def public(self):
         a=self.account()
         for p in a['holdings']:
@@ -142,4 +158,4 @@ class Store:
         realized=self.db.execute('SELECT COALESCE(SUM(realized),0) FROM trades').fetchone()[0]/SCALE
         stock_risks={p['symbol']:p['risk'] for p in a['holdings']}
         archive_stats=self.db.execute('SELECT COUNT(*),MIN(bucket),MAX(bucket),COUNT(DISTINCT symbol) FROM price_history').fetchone()
-        return {**a,'price_memory':{'samples':archive_stats[0],'first':archive_stats[1],'last':archive_stats[2],'symbols':archive_stats[3],'error':self.get('collection_error'),'retention_days':90,'interval_minutes':5},'start_not_before':self.get('start_not_before'),'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':0.55,'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}
+        return {**a,'price_memory':{'samples':archive_stats[0],'first':archive_stats[1],'last':archive_stats[2],'symbols':archive_stats[3],'error':self.get('collection_error'),'retention_days':90,'interval_minutes':5},'start_not_before':self.get('start_not_before'),'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':.55*len(self.ai_budgets()),'ai_key_budgets':self.ai_budgets(),'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}

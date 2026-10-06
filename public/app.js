@@ -16,6 +16,8 @@ function render(d){
  $('phase').textContent=d.phase;$('model').textContent=d.model==='pending'?'Awaiting first deliberation':d.model;$('last-cycle').textContent=stamp(d.last_cycle);
  const thought=d.notes.find(n=>n.kind==='decision'||n.kind==='reflection'||n.kind==='plan');$('latest-thought').textContent=thought?thought.body:'The agent’s first deliberation will appear here. No synthetic trades or notes are displayed.';
  const ai=d.usage.find(u=>u.provider==='ai');const reserved=ai?.reserved||0;const budget=d.ai_budget||.55;$('budget-label').textContent='$'+reserved.toFixed(3)+' / $'+budget.toFixed(2);$('budget-fill').style.width=Math.min(100,reserved/budget*100)+'%';
+ $('key-budgets').innerHTML=(d.ai_key_budgets||[]).map(key=>`<p>${escape(key.label)}: $${key.reserved.toFixed(3)} / $0.55 · $0.05 buffer${key.cooldown_until>Date.now()/1000?' · retry '+escape(stamp(key.cooldown_until)):''}</p>`).join('');
+ $('budget-buffer').textContent='$0.05 kept outside each key’s $0.60 allowance. '+(d.ai_key_budgets?.length||1)+' key(s) configured.';
  $('position-count').textContent=d.holdings.length;
  $('strategy-name').textContent=d.strategy||'AI-selected';$('strategy-horizon').textContent=d.strategy_horizon||'Undecided';$('strategy-why').textContent=d.strategy_why||'';
  const limits=d.provider_limits?.ai||{};

@@ -24,8 +24,8 @@ def reset_time(value,stamp):
         try:return parsedate_to_datetime(s).timestamp()
         except (ValueError,TypeError,OverflowError):return None
 
-def capture(store,provider,response,stamp):
-    headers=response.headers;key='limits_'+provider
+def capture(store,provider,response,stamp,scope=None):
+    headers=response.headers;key='limits_'+provider+('_'+scope if scope else '')
     row=store.db.execute('SELECT value FROM state WHERE key=?',(key,)).fetchone()
     import json
     metadata=json.loads(row[0]) if row else {}
@@ -59,6 +59,14 @@ def capture(store,provider,response,stamp):
         metadata['credit_retry_source']='x-credit-reset-at' if credit else 'UTC day fallback; not confirmed by rate-limit headers'
         blocking.append(target)
     if response.status_code in (401,403,422):blocking.append(stamp+86400)
-    if blocking:store.set('cooldown_'+provider,max(store.get('cooldown_'+provider),max(blocking)+1))
+    if blocking:
+        cooldown_key='cooldown_'+provider+('_'+scope if scope else '')
+        row=store.db.execute('SELECT value FROM state WHERE key=?',(cooldown_key,)).fetchone()
+        previous=json.loads(row[0]) if row else 0
+        store.set(cooldown_key,max(previous,max(blocking)+1))
+        # Request/token exhaustion may be account-wide: do not switch keys to bypass it.
+        if scope and (response.status_code==429 or any(metadata.get(c+'_remaining')==0 for c in ('requests','tokens'))):
+            store.set('cooldown_'+provider,max(store.get('cooldown_'+provider),max(blocking)+1))
     store.set(key,metadata)
+    if scope:store.set('limits_'+provider,metadata)
     return metadata

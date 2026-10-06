@@ -1,5 +1,5 @@
 """Autonomous research loop. Provider URLs are fixed; no Alpaca order client exists."""
-import asyncio, json, math, os, time, uuid, re, logging
+import asyncio, json, math, os, time, uuid, re, logging, hashlib
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import httpx, websockets
@@ -27,6 +27,33 @@ class Engine:
         self.credentials=[(os.getenv('ALPACA_KEY',''),os.getenv('ALPACA_SECRET',''))]+[(os.getenv('ALPACA_KEY_'+str(i),''),os.getenv('ALPACA_SECRET_'+str(i),'')) for i in (2,3,4)]
         self.credentials=[pair for pair in self.credentials if all(pair)];self.credential_index=0
         self.headers=self.price_headers()
+        self.register_ai_keys()
+    def ai_credentials(self):
+        pairs=[];seen=set()
+        for name in ('HACKCLUB_AI_KEY','HACKCLUB_AI_KEY_2'):
+            key=os.getenv(name,'')
+            if not key:continue
+            ident=hashlib.sha256(key.encode()).hexdigest()
+            if ident not in seen:pairs.append((ident,key));seen.add(ident)
+        return pairs
+    def register_ai_keys(self):
+        pairs=self.ai_credentials()
+        if pairs:
+            self.s.db.execute("UPDATE requests SET credential=? WHERE provider='ai' AND credential IS NULL",(pairs[0][0],))
+            self.s.set('ai_key_ids',[p[0] for p in pairs])
+        return pairs
+    def reserve_ai(self,cost):
+        if now()<self.s.get('cooldown_ai'):raise ValueError('AI is cooling down')
+        pairs=self.register_ai_keys()
+        if not pairs:raise ValueError('AI credentials missing')
+        def spent(pair):
+            return self.s.db.execute("SELECT COALESCE(SUM(cost),0) FROM requests WHERE provider='ai' AND credential=? AND ts>?",(pair[0],now()-86400)).fetchone()[0]
+        for ident,key in sorted(pairs,key=spent):
+            row=self.s.db.execute('SELECT value FROM state WHERE key=?',('cooldown_ai_'+ident,)).fetchone()
+            if row and json.loads(row[0])>now():continue
+            rid=self.s.reserve('ai',cost=cost,cap=57,credential=ident)
+            if rid is not None:return rid,ident,key
+        raise ValueError('AI daily budget reserved; waiting for next allowance')
     def price_headers(self):
         pair=self.credentials[self.credential_index] if self.credentials else ('','')
         return {'APCA-API-KEY-ID':pair[0],'APCA-API-SECRET-KEY':pair[1]}
@@ -199,12 +226,11 @@ class Engine:
         m=await self.select_model();raw=self.context(news,opened)
         # Reserve the complete worst-case charge BEFORE sending. Keep it reserved even on timeouts.
         if now()<self.s.get('cooldown_ai'):raise ValueError('AI is cooling down')
-        rid=self.s.reserve('ai',cost=m['worst'],cap=57)
-        if rid is None:raise ValueError('AI daily budget reserved; waiting for next allowance')
+        rid,credential,key=self.reserve_ai(m['worst'])
         try:
-            r=await self.http.post(AI+'/chat/completions',headers={'Authorization':'Bearer '+os.environ['HACKCLUB_AI_KEY']},json={'provider':{'max_price':{'prompt':m['input']*1e6,'completion':m['output']*1e6,'request':0},'sort':'price'},'model':m['id'],'messages':[{'role':'system','content':PROMPT},{'role':'user','content':raw}],'max_tokens':1800,'temperature':0.65,'response_format':{'type':'json_object'},'reasoning':{'enabled':False}})
+            r=await self.http.post(AI+'/chat/completions',headers={'Authorization':'Bearer '+key},json={'provider':{'max_price':{'prompt':m['input']*1e6,'completion':m['output']*1e6,'request':0},'sort':'price'},'model':m['id'],'messages':[{'role':'system','content':PROMPT},{'role':'user','content':raw}],'max_tokens':1800,'temperature':0.65,'response_format':{'type':'json_object'},'reasoning':{'enabled':False}})
             from .limits import capture
-            capture(self.s,'ai',r,now())
+            capture(self.s,'ai',r,now(),scope=credential)
             r.raise_for_status();data=r.json();self.s.complete(rid,'ok')
             actual=float(data.get('usage',{}).get('cost',0) or 0)
             if not math.isfinite(actual) or actual>m['worst']:
@@ -311,7 +337,8 @@ class Engine:
             finally:self.ws=None;self.subscribed=[]
             await asyncio.sleep(delay);delay=min(300,delay*2)
     async def loop(self):
-        next_cycle=self.s.get('last_cycle')+600;last_snapshot=0
+        interval=300 if len(self.ai_credentials())>1 else 600
+        next_cycle=self.s.get('last_cycle')+interval;last_snapshot=0
         while self.running:
             try:
                 self.s.set('phase',self.phase())
@@ -323,7 +350,7 @@ class Engine:
                         if now()-last_snapshot>=60:self.s.snapshot();last_snapshot=now()
                     review_due=not opened and local.hour>=10 and (self.s.get('last_plan')!=day or self.s.get('plan_version')<1)
                     if now()>=next_cycle and (opened or review_due):
-                        next_cycle=now()+600
+                        next_cycle=now()+interval
                         self.cycle_stage='market quotes'
                         if opened and (not self.stream_ready or now()-self.s.get('last_stream')>60):await self.fallback_quotes()
                         self.cycle_stage='research'
