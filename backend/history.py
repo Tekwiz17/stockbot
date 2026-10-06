@@ -1,10 +1,11 @@
-"""Six-month price memory and summaries, calculated locally without AI calls."""
+"""Compact price memory and summaries, calculated locally without AI calls."""
 import math
 from .store import SCALE,now
 RETENTION=90*86400
 
 def archive(store,symbols,stamp=None):
     stamp=now() if stamp is None else stamp
+    if not store.recording_allowed():return
     bucket=int(stamp//300)*300
     for symbol in symbols:
         q=store.latest(symbol)

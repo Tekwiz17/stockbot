@@ -1,5 +1,5 @@
 """SQLite ledger: one writer, integer microdollars and microshares, atomic fills."""
-import json, sqlite3, time
+import json, sqlite3, time, shutil
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 
@@ -40,7 +40,7 @@ class Store:
         ''')
         if 'credential' not in {r[1] for r in self.db.execute('PRAGMA table_info(requests)')}:
             self.db.execute('ALTER TABLE requests ADD COLUMN credential TEXT')
-        for k,v in {'cash':INITIAL,'status':'running','model':'pending','phase':'Connecting','last_cycle':0,'last_error':'','last_stream':0,'collection_error':'','start_not_before':0,'last_reflection':'','strategy':'AI choosing strategy','strategy_why':'Awaiting the next autonomous decision','strategy_horizon':'Undecided','plan':None,'plan_version':0,'last_plan':'','cooldown_ai':0,'cooldown_search':0,'cooldown_alpaca':0}.items():
+        for k,v in {'cash':INITIAL,'status':'running','model':'pending','phase':'Connecting','last_cycle':0,'last_error':'','last_stream':0,'collection_error':'','stream_status':'Connecting','stream_count':0,'storage_warning':'','start_not_before':0,'last_reflection':'','strategy':'AI choosing strategy','strategy_why':'Awaiting the next autonomous decision','strategy_horizon':'Undecided','plan':None,'plan_version':0,'last_plan':'','cooldown_ai':0,'cooldown_search':0,'cooldown_alpaca':0}.items():
             self.db.execute('INSERT OR IGNORE INTO state VALUES (?,?)',(k,json.dumps(v)))
         if not self.db.execute("SELECT 1 FROM state WHERE key='history_migrated'").fetchone():
             # Preserve genuine existing observations, choosing the final quote of each five-minute bucket.
@@ -64,15 +64,31 @@ class Store:
             self.db.execute('COMMIT');return c.lastrowid
         except BaseException: self.db.execute('ROLLBACK');raise
     def complete(self,rid,status): self.db.execute('UPDATE requests SET status=? WHERE id=?',(status,rid))
+    def recording_allowed(self):
+        stamp=now()
+        if stamp-getattr(self,'storage_checked',0)>30:
+            self.storage_checked=stamp
+            pages=self.db.execute('PRAGMA page_count').fetchone()[0]-self.db.execute('PRAGMA freelist_count').fetchone()[0]
+            used=pages*self.db.execute('PRAGMA page_size').fetchone()[0]
+            path=self.db.execute('PRAGMA database_list').fetchone()[2]
+            self.storage_ok=used<512*1024*1024 and shutil.disk_usage(Path(path).parent).free>512*1024*1024
+            self.set('storage_warning','' if self.storage_ok else 'Price recording paused: 512 MiB database budget or disk reserve reached')
+        return self.storage_ok
     def quote(self,symbol,bid,ask,ts,source='IEX'):
         b,a=units(bid),units(ask)
         if not (0<b<=a) or a>b*1.02 or ts>now()+5: return
-        self.db.execute('INSERT INTO prices(ts,symbol,bid,ask,source) VALUES (?,?,?,?,?)',(ts,symbol,b,a,source))
+        if not self.recording_allowed():return
+        recent=self.db.execute('SELECT id,ts FROM prices WHERE symbol=? ORDER BY ts DESC LIMIT 1',(symbol,)).fetchone()
+        if recent and int(recent['ts']//60)==int(ts//60):
+            if ts>=recent['ts']:self.db.execute('UPDATE prices SET ts=?,bid=?,ask=?,source=? WHERE id=?',(ts,b,a,source,recent['id']))
+        else:self.db.execute('INSERT INTO prices(ts,symbol,bid,ask,source) VALUES (?,?,?,?,?)',(ts,symbol,b,a,source))
+        if 0<=now()-ts<=300:self.db.execute('INSERT OR REPLACE INTO price_history VALUES (?,?,?,?,?)',(symbol,int(ts//300)*300,ts,b,a))
     def bar(self,symbol,open_,high,low,close,volume,ts):
         import math
         values=(open_,high,low,close,volume,ts)
         if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in values):return
         if min(open_,high,low,close)<=0 or volume<0 or low>min(open_,close) or high<max(open_,close) or ts>now()+5:return
+        if not self.recording_allowed():return
         self.db.execute('INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?)',(symbol,ts,open_,high,low,close,volume))
     def latest(self,symbol):
         r=self.db.execute('SELECT * FROM prices WHERE symbol=? ORDER BY ts DESC LIMIT 1',(symbol,)).fetchone()
@@ -116,11 +132,13 @@ class Store:
     def snapshot(self):
         a=self.account();self.db.execute('INSERT INTO equity(ts,equity,cash) VALUES (?,?,?)',(now(),a['equity'],a['cash']))
     def prune(self):
-        self.db.execute('DELETE FROM bars WHERE ts<?',(now()-14*86400,))
+        self.db.execute('DELETE FROM price_history WHERE bucket < ? - COALESCE((SELECT days FROM history_retention WHERE history_retention.symbol=price_history.symbol),90)*86400',(now(),))
+        self.db.execute('DELETE FROM bars WHERE ts<?',(now()-7*86400,))
         self.db.execute('DELETE FROM cycle_errors WHERE ts<?',(now()-30*86400,))
         # Retain 14 days of minute quote records; trades and decision notes are permanent.
-        self.db.execute('DELETE FROM prices WHERE ts<? AND id NOT IN (SELECT id FROM prices WHERE (symbol,ts) IN (SELECT symbol,MAX(ts) FROM prices GROUP BY symbol))',(now()-14*86400,))
+        self.db.execute('DELETE FROM prices WHERE ts<? AND id NOT IN (SELECT id FROM prices WHERE (symbol,ts) IN (SELECT symbol,MAX(ts) FROM prices GROUP BY symbol))',(now()-7*86400,))
         self.db.execute('DELETE FROM auth_attempts WHERE ts<?',(now()-86400,))
+        self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     def risk(self,symbol,weight=0):
         from .risk import calculate
         raw=self.rows('SELECT ts,bid,ask FROM prices WHERE symbol=? ORDER BY ts DESC LIMIT 1560',(symbol,))
@@ -158,4 +176,4 @@ class Store:
         realized=self.db.execute('SELECT COALESCE(SUM(realized),0) FROM trades').fetchone()[0]/SCALE
         stock_risks={p['symbol']:p['risk'] for p in a['holdings']}
         archive_stats=self.db.execute('SELECT COUNT(*),MIN(bucket),MAX(bucket),COUNT(DISTINCT symbol) FROM price_history').fetchone()
-        return {**a,'price_memory':{'samples':archive_stats[0],'first':archive_stats[1],'last':archive_stats[2],'symbols':archive_stats[3],'error':self.get('collection_error'),'retention_days':90,'interval_minutes':5},'start_not_before':self.get('start_not_before'),'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':.55*len(self.ai_budgets()),'ai_key_budgets':self.ai_budgets(),'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}
+        return {**a,'price_memory':{'samples':archive_stats[0],'first':archive_stats[1],'last':archive_stats[2],'symbols':archive_stats[3],'error':self.get('collection_error'),'retention_days':90,'interval_minutes':5},'stream_count':self.get('stream_count'),'stream_status':self.get('stream_status'),'storage_warning':self.get('storage_warning'),'start_not_before':self.get('start_not_before'),'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':.55*len(self.ai_budgets()),'ai_key_budgets':self.ai_budgets(),'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}

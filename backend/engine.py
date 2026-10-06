@@ -22,7 +22,7 @@ Output complete JSON under 1,200 tokens, concise prose (note <=80 words): {"titl
 class Engine:
     def __init__(self,store):
         self.s=store;self.cal=xcals.get_calendar('XNYS');self.http=httpx.AsyncClient(timeout=45)
-        self.cycle_stage='idle';self.ws=None;self.subscribed=[];self.stream_ready=False;self.last_saved={};self.model=None;self.last_catalog=0;self.closed_note_day='';self.running=True
+        self.stream_capacity=10000;self.cycle_stage='idle';self.ws=None;self.subscribed=[];self.stream_ready=False;self.last_saved={};self.model=None;self.last_catalog=0;self.closed_note_day='';self.running=True
         if self.s.get('strategy')=='Aggressive catalyst + momentum':self.s.set('strategy','AI choosing strategy')
         self.credentials=[(os.getenv('ALPACA_KEY',''),os.getenv('ALPACA_SECRET',''))]+[(os.getenv('ALPACA_KEY_'+str(i),''),os.getenv('ALPACA_SECRET_'+str(i),'')) for i in (2,3,4)]
         self.credentials=[pair for pair in self.credentials if all(pair)];self.credential_index=0
@@ -64,7 +64,7 @@ class Engine:
         held=[p['symbol'] for p in self.s.rows('SELECT symbol FROM positions WHERE qty>0')]
         plan=self.s.get('plan') or {}
         watch=[p['symbol'] for p in plan.get('watchlist',[]) if self.valid_symbol(p.get('symbol'))]
-        return list(dict.fromkeys(held+watch+SYMBOLS))[:30]
+        return list(dict.fromkeys(held+watch+SYMBOLS))[:self.stream_capacity]
     def collection_symbols(self):
         held=[p['symbol'] for p in self.s.rows('SELECT symbol FROM positions WHERE qty>0')]
         return list(dict.fromkeys(SYMBOLS+held+self.tracked_symbols()))
@@ -79,6 +79,9 @@ class Engine:
             try:
                 row=self.s.db.execute("SELECT value FROM state WHERE key='last_price_poll'").fetchone()
                 last=json.loads(row[0]) if row else 0
+                maintenance=self.s.db.execute("SELECT value FROM state WHERE key='last_storage_prune'").fetchone()
+                if not maintenance or now()-json.loads(maintenance[0])>3600:
+                    self.s.prune();self.s.set('last_storage_prune',now())
                 if self.s.get('status')!='stopped' and all(os.getenv(k) for k in ('ALPACA_KEY','ALPACA_SECRET')) and self.market_open() and int(now()//300)>int(last//300):
                     await self.collect_once()
             except asyncio.CancelledError:raise
@@ -315,7 +318,7 @@ class Engine:
     async def stream(self):
         delay=5
         while self.running:
-            if not self.configured() or not self.market_open() or self.s.get('status')!='running':
+            if not self.credentials or self.s.get('status')=='stopped':
                 self.stream_ready=False;await asyncio.sleep(20);continue
             try:
                 async with websockets.connect('wss://stream.data.alpaca.markets/v2/iex',open_timeout=20,ping_interval=20,max_size=2**22) as ws:
@@ -323,7 +326,16 @@ class Engine:
                     authenticated=False
                     async for message in ws:
                         for event in json.loads(message):
-                            if event.get('T')=='error':raise ValueError('Alpaca stream rejected authentication or subscription')
+                            if event.get('T')=='error':
+                                if event.get('code')==405 and self.stream_capacity>30:
+                                    self.stream_capacity=30;self.subscribed=[]
+                                    self.s.set('stream_status','Provider limits this account to 30 streamed symbols; full watchlist is polled every five minutes')
+                                    await self.sync_subscription();continue
+                                self.s.set('stream_status','Stream unavailable: provider error '+str(event.get('code','unknown')))
+                                raise ValueError('Alpaca stream rejected authentication or subscription')
+                            if event.get('T')=='subscription':
+                                confirmed=event.get('quotes',[]);self.s.set('stream_count',len(confirmed))
+                                if self.stream_capacity>30:self.s.set('stream_status','Connected · full watchlist requested')
                             if event.get('T')=='success' and event.get('msg')=='authenticated':
                                 authenticated=True;self.ws=ws;self.subscribed=[];await self.sync_subscription()
                             if event.get('T')=='b' and authenticated and event.get('S') in self.subscribed:
@@ -332,9 +344,11 @@ class Engine:
                                 self.stream_ready=True;delay=5;symbol=event['S'];self.s.set('last_stream',now())
                                 if symbol in self.subscribed and now()-self.last_saved.get(symbol,0)>=15:
                                     self.s.quote(symbol,event['bp'],event['ap'],datetime.fromisoformat(event['t'].replace('Z','+00:00')).timestamp());self.last_saved[symbol]=now()
-                        if not self.market_open() or self.s.get('status')!='running':break
+                        if self.s.get('status')=='stopped':break
             except Exception:self.stream_ready=False
-            finally:self.ws=None;self.subscribed=[]
+            finally:
+                self.ws=None;self.subscribed=[];self.s.set('stream_count',0)
+                self.s.set('stream_status','Disconnected · retrying'+(' · 30-symbol provider limit' if self.stream_capacity==30 else ''))
             await asyncio.sleep(delay);delay=min(300,delay*2)
     async def loop(self):
         interval=300 if len(self.ai_credentials())>1 else 600

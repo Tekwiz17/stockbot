@@ -236,7 +236,9 @@ def test_stream_subscription_includes_bars(store):
             async def send(self,message):messages.append(json.loads(message))
         e.ws=WS();await e.sync_subscription()
         assert messages[0]['bars']==messages[0]['quotes']
-        assert len(messages[0]['bars'])<=30
+        assert len(messages[0]['bars'])==120
+        e.stream_capacity=30;messages.clear();await e.sync_subscription()
+        assert len(e.subscribed)==30
         await e.close()
     asyncio.run(run())
 
@@ -438,3 +440,18 @@ def test_scoped_ai_credit_cooldown_and_global_request_cooldown(store,monkeypatch
         assert store.get('cooldown_ai')>now()
         await e.close()
     asyncio.run(run())
+
+def test_quotes_compact_per_minute_and_history_per_five_minutes(store):
+    stamp=int(now()//300)*300+1
+    # Use a bucket already begun, so timestamps remain genuine past observations.
+    if stamp>now():stamp-=300
+    store.quote('NVDA',100,100.05,stamp)
+    store.quote('NVDA',101,101.05,min(stamp+1,now()))
+    assert len(store.rows("SELECT * FROM prices WHERE symbol='NVDA'"))==1
+    assert len(store.rows("SELECT * FROM price_history WHERE symbol='NVDA'"))==1
+    assert store.latest('NVDA')['bid']==101*SCALE
+
+def test_storage_guard_pauses_prices_without_affecting_cash(store):
+    store.storage_checked=now();store.storage_ok=False
+    before=store.get('cash');quote(store)
+    assert store.latest('NVDA') is None and store.get('cash')==before
