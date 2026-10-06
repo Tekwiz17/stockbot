@@ -31,7 +31,7 @@ def same_origin(req):
 @asynccontextmanager
 async def lifespan(app):
     if os.getenv('STOCKBOT_DISABLE_WORKER')=='1':tasks=[]
-    else:tasks=[asyncio.create_task(engine.loop()),asyncio.create_task(engine.stream())]
+    else:tasks=[asyncio.create_task(engine.loop()),asyncio.create_task(engine.stream()),asyncio.create_task(engine.collector())]
     yield
     for t in tasks:t.cancel()
     await asyncio.gather(*tasks,return_exceptions=True)
@@ -55,6 +55,17 @@ async def health():return {'ok':True,'worker_enabled':os.getenv('STOCKBOT_DISABL
 async def public():
     # All visitors read the database. None can invoke a paid provider or a trading cycle.
     return JSONResponse(store.public(),headers={'Cache-Control':'public, max-age=15, s-maxage=30, stale-while-revalidate=60'})
+
+@app.get('/api/history/{symbol}')
+async def history(symbol:str,days:int=30,before:int=0):
+    # Read-only pagination; never pulls prices or invokes AI.
+    if not engine.valid_symbol(symbol):raise HTTPException(400,'Invalid ticker')
+    cutoff=time.time()-max(1,min(183,days))*86400
+    ceiling=before if before>0 else time.time()+1
+    rows=store.rows('SELECT bucket,quote_ts,bid,ask FROM price_history WHERE symbol=? AND bucket>=? AND bucket<? ORDER BY bucket DESC LIMIT 2000',(symbol,cutoff,ceiling))
+    for row in rows:
+        row['bid']/=1000000;row['ask']/=1000000
+    return {'symbol':symbol,'interval_minutes':5,'points':rows[::-1],'next_before':rows[-1]['bucket'] if len(rows)==2000 else None}
 
 @app.post('/api/admin/login')
 async def login(req:Request):

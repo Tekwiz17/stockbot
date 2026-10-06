@@ -258,3 +258,87 @@ def test_full_bar_context_stays_inside_input_budget(store):
         assert json.loads(raw)['trade_count']==0
         await e.close()
     asyncio.run(run())
+
+def test_history_retention_and_stale_quotes(store):
+    from backend.history import archive,RETENTION,summary
+    quote(store,'NVDA');quote(store,'AMD',age=400)
+    archive(store,['NVDA','AMD'])
+    assert store.db.execute('SELECT COUNT(*) FROM price_history').fetchone()[0]==1
+    assert summary(store,'NVDA')['samples']==1
+    store.db.execute('INSERT INTO price_history VALUES (?,?,?,?,?)',('OLD',now()-RETENTION-300,now()-RETENTION-300,100*SCALE,101*SCALE))
+    archive(store,['NVDA'])
+    assert not store.db.execute("SELECT 1 FROM price_history WHERE symbol='OLD'").fetchone()
+
+def test_collector_fetches_all_30_without_ai(store):
+    async def run():
+        e=Engine(store);captured=[]
+        async def prices(symbols):
+            captured.extend(symbols)
+            for symbol in symbols:quote(store,symbol)
+        e.fallback_quotes=prices
+        await e.collect_once()
+        assert set(SYMBOLS)<=set(captured)
+        assert store.public()['price_memory']['symbols']==30
+        assert not store.rows("SELECT * FROM requests WHERE provider='ai'")
+        await e.close()
+    asyncio.run(run())
+
+def test_swing_does_not_panic_sell_but_thesis_break_can_exit(store):
+    async def run():
+        e=Engine(store);e.market_open=lambda stamp=None:True;quote(store)
+        e.apply({'actions':[{'symbol':'NVDA','side':'buy','quantity':20,'reason':'Multi-session trend thesis','horizon':'swing','invalidation':'Bid breaks $90 support','stop_pct':.1}]},True)
+        store.quote('NVDA',99.8,99.85,now())
+        e.apply({'actions':[{'symbol':'NVDA','side':'sell','quantity':20,'reason':'Tiny loss and negative thirty-minute momentum'}]},True)
+        assert store.account()['holdings'][0]['qty']==20*SCALE
+        e.apply({'actions':[{'symbol':'NVDA','side':'sell','quantity':20,'reason':'Specific catalyst has invalidated the entry thesis','exit_type':'thesis_break','invalidation_evidence':'A supplied, verified earnings update disproved the documented revenue thesis'}]},True)
+        assert not store.account()['holdings']
+        await e.close()
+    asyncio.run(run())
+
+def test_target_partially_exits_and_stop_still_works(store):
+    async def run():
+        e=Engine(store);e.market_open=lambda stamp=None:True;quote(store)
+        e.apply({'actions':[{'symbol':'NVDA','side':'buy','quantity':20,'reason':'Multi-session strong trend','horizon':'swing','stop_pct':.1,'target_pct':.1,'target_fraction':.5}]},True)
+        store.quote('NVDA',112,112.05,now());e.conditional_exits()
+        assert store.account()['holdings'][0]['qty']==10*SCALE
+        e.conditional_exits();assert store.account()['holdings'][0]['qty']==10*SCALE
+        store.quote('NVDA',89,89.05,now());e.conditional_exits()
+        assert not store.account()['holdings']
+        await e.close()
+    asyncio.run(run())
+
+def test_adding_position_preserves_original_horizon_and_stop(store):
+    async def run():
+        e=Engine(store);e.market_open=lambda stamp=None:True;quote(store)
+        e.apply({'actions':[{'symbol':'NVDA','side':'buy','quantity':20,'reason':'Multi-day trend thesis','horizon':'medium-term','stop_pct':.12}]},True)
+        original=e.holding_plan('NVDA');stop=store.get('exit_NVDA')['stop']
+        e.apply({'actions':[{'symbol':'NVDA','side':'buy','quantity':5,'reason':'Add to intact trend thesis','horizon':'intraday','stop_pct':.02}]},True)
+        assert e.holding_plan('NVDA')==original
+        assert store.get('exit_NVDA')['stop']==stop
+        await e.close()
+    asyncio.run(run())
+
+def test_overnight_quote_is_not_30_minute_momentum(store):
+    async def run():
+        e=Engine(store);quote(store,age=86400);store.quote('NVDA',110,110.05,now())
+        q=next(q for q in json.loads(e.context([],True))['quotes'] if q['symbol']=='NVDA')
+        assert q['momentum_30m'] is None
+        await e.close()
+    asyncio.run(run())
+
+def test_existing_prices_migrate_to_actual_five_minute_history(store):
+    quote(store,'NVDA');path=store.db.execute('PRAGMA database_list').fetchone()[2]
+    store.db.execute("DELETE FROM state WHERE key='history_migrated'");store.db.close()
+    reopened=Store(path)
+    row=reopened.db.execute('SELECT * FROM price_history WHERE symbol=?',('NVDA',)).fetchone()
+    assert row and row['bid']==100*SCALE
+    assert row['bucket']<=row['quote_ts']<row['bucket']+300
+
+def test_closed_review_can_inspect_saved_history(store):
+    async def run():
+        from backend.history import archive
+        e=Engine(store);quote(store,age=120);archive(store,['NVDA'])
+        q=next(q for q in json.loads(e.context([],False))['quotes'] if q['symbol']=='NVDA')
+        assert q['stale'] is True and q['history']['samples']==1
+        await e.close()
+    asyncio.run(run())
