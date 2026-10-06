@@ -1,7 +1,7 @@
 """Six-month price memory and summaries, calculated locally without AI calls."""
 import math
 from .store import SCALE,now
-RETENTION=183*86400
+RETENTION=90*86400
 
 def archive(store,symbols,stamp=None):
     stamp=now() if stamp is None else stamp
@@ -10,7 +10,7 @@ def archive(store,symbols,stamp=None):
         q=store.latest(symbol)
         if q and 0<=stamp-q['ts']<=300:
             store.db.execute('INSERT OR REPLACE INTO price_history VALUES (?,?,?,?,?)',(symbol,bucket,q['ts'],q['bid'],q['ask']))
-    store.db.execute('DELETE FROM price_history WHERE bucket<?',(stamp-RETENTION,))
+    store.db.execute('DELETE FROM price_history WHERE bucket<? AND bucket < ? - COALESCE((SELECT days FROM history_retention WHERE history_retention.symbol=price_history.symbol),90)*86400',(stamp-RETENTION,stamp))
     store.set('last_price_archive',stamp)
 
 def summary(store,symbol,stamp=None):

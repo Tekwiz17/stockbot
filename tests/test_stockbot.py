@@ -93,7 +93,7 @@ def test_api_auth_origin_and_control_only(tmp_path,monkeypatch):
 def test_no_alpaca_order_or_account_api_in_source():
     from pathlib import Path
     text=Path('backend/engine.py').read_text();assert 'paper-api.alpaca' not in text;assert '/orders' not in text;assert '/positions' not in text
-    assert len(SYMBOLS)==30
+    assert len(SYMBOLS)==120
 
 def test_unexpected_provider_cost_stops_future_ai_calls(store,monkeypatch):
     monkeypatch.setenv('HACKCLUB_AI_KEY','test')
@@ -278,7 +278,7 @@ def test_collector_fetches_all_30_without_ai(store):
         e.fallback_quotes=prices
         await e.collect_once()
         assert set(SYMBOLS)<=set(captured)
-        assert store.public()['price_memory']['symbols']==30
+        assert store.public()['price_memory']['symbols']==120
         assert not store.rows("SELECT * FROM requests WHERE provider='ai'")
         await e.close()
     asyncio.run(run())
@@ -340,5 +340,62 @@ def test_closed_review_can_inspect_saved_history(store):
         e=Engine(store);quote(store,age=120);archive(store,['NVDA'])
         q=next(q for q in json.loads(e.context([],False))['quotes'] if q['symbol']=='NVDA')
         assert q['stale'] is True and q['history']['samples']==1
+        await e.close()
+    asyncio.run(run())
+
+def test_reset_restores_capital_preserves_provider_budget_and_is_one_time(store):
+    from backend.reset import reset_experiment
+    from backend.history import archive
+    quote(store);store.fill('old','NVDA','buy',20,'Old experiment thesis',True)
+    store.reserve('ai',.01);store.set('cooldown_ai',now()+100)
+    archive(store,['NVDA']);store.note('decision','Old','Old journal')
+    start=now()+3600
+    assert reset_experiment(store,start,'test-reset')
+    assert store.get('cash')==100000*SCALE and not store.account()['holdings']
+    assert not store.rows('SELECT * FROM trades') and not store.rows('SELECT * FROM notes')
+    assert store.rows('SELECT * FROM requests') and store.get('cooldown_ai')>now()
+    assert store.rows('SELECT * FROM price_history')
+    with pytest.raises(ValueError):store.fill('early','NVDA','buy',1,'Pre-launch attempt',True)
+    assert reset_experiment(store,start,'test-reset') is False
+
+def test_default_90_day_retention_and_ai_extension(store):
+    from backend.history import archive
+    stamp=now();old=int((stamp-120*86400)//300)*300
+    store.db.execute('INSERT INTO price_history VALUES (?,?,?,?,?)',('NVDA',old,old,100*SCALE,101*SCALE))
+    store.db.execute('INSERT INTO price_history VALUES (?,?,?,?,?)',('AMD',old,old,100*SCALE,101*SCALE))
+    async def run():
+        e=Engine(store)
+        e.apply({'actions':[],'retain_history':[{'symbol':'NVDA','days':180,'reason':'Long horizon comparison'}]},False)
+        await e.close()
+    asyncio.run(run());archive(store,[],stamp)
+    assert store.db.execute("SELECT 1 FROM price_history WHERE symbol='NVDA'").fetchone()
+    assert not store.db.execute("SELECT 1 FROM price_history WHERE symbol='AMD'").fetchone()
+
+def test_extra_keys_only_auth_failover_and_shared_usage(store,monkeypatch):
+    monkeypatch.setenv('ALPACA_KEY','one');monkeypatch.setenv('ALPACA_SECRET','secret-one')
+    monkeypatch.setenv('ALPACA_KEY_2','two');monkeypatch.setenv('ALPACA_SECRET_2','secret-two')
+    async def run():
+        e=Engine(store);seen=[]
+        def response(request):
+            key=request.headers['APCA-API-KEY-ID'];seen.append(key)
+            return httpx.Response(401 if key=='one' else 200,json={'quotes':{}})
+        await e.http.aclose();e.http=httpx.AsyncClient(transport=httpx.MockTransport(response))
+        await e.fallback_quotes(['NVDA'])
+        assert seen==['one','two']
+        assert len(store.rows("SELECT * FROM requests WHERE provider='alpaca'"))==2
+        await e.close()
+    asyncio.run(run())
+
+def test_extra_keys_do_not_bypass_429(store,monkeypatch):
+    monkeypatch.setenv('ALPACA_KEY','one');monkeypatch.setenv('ALPACA_SECRET','secret-one')
+    monkeypatch.setenv('ALPACA_KEY_2','two');monkeypatch.setenv('ALPACA_SECRET_2','secret-two')
+    async def run():
+        e=Engine(store);seen=[]
+        def response(request):
+            seen.append(request.headers['APCA-API-KEY-ID'])
+            return httpx.Response(429,headers={'retry-after':'60'},json={})
+        await e.http.aclose();e.http=httpx.AsyncClient(transport=httpx.MockTransport(response))
+        with pytest.raises(httpx.HTTPStatusError):await e.fallback_quotes(['NVDA'])
+        assert seen==['one'] and store.get('cooldown_alpaca')>now()
         await e.close()
     asyncio.run(run())

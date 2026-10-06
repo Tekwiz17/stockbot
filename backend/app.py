@@ -60,7 +60,7 @@ async def public():
 async def history(symbol:str,days:int=30,before:int=0):
     # Read-only pagination; never pulls prices or invokes AI.
     if not engine.valid_symbol(symbol):raise HTTPException(400,'Invalid ticker')
-    cutoff=time.time()-max(1,min(183,days))*86400
+    cutoff=time.time()-max(1,min(365,days))*86400
     ceiling=before if before>0 else time.time()+1
     rows=store.rows('SELECT bucket,quote_ts,bid,ask FROM price_history WHERE symbol=? AND bucket>=? AND bucket<? ORDER BY bucket DESC LIMIT 2000',(symbol,cutoff,ceiling))
     for row in rows:

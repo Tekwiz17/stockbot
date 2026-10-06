@@ -31,17 +31,18 @@ class Store:
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,ts REAL,provider TEXT,cost REAL,status TEXT);
         CREATE TABLE IF NOT EXISTS research(id INTEGER PRIMARY KEY,ts REAL,query TEXT,results TEXT);
         CREATE TABLE IF NOT EXISTS price_history(symbol TEXT,bucket INTEGER,quote_ts REAL,bid INTEGER,ask INTEGER,PRIMARY KEY(symbol,bucket));
+        CREATE TABLE IF NOT EXISTS history_retention(symbol TEXT PRIMARY KEY,days INTEGER,reason TEXT);
         CREATE TABLE IF NOT EXISTS position_plans(symbol TEXT PRIMARY KEY,created_at REAL,horizon TEXT,review_after REAL,thesis TEXT,invalidation TEXT);
         CREATE TABLE IF NOT EXISTS cycle_errors(ts REAL,stage TEXT,kind TEXT,detail TEXT);
         CREATE TABLE IF NOT EXISTS bars(symbol TEXT,ts REAL,open REAL,high REAL,low REAL,close REAL,volume REAL,PRIMARY KEY(symbol,ts));
         CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,ts REAL,kind TEXT,payload TEXT);
         CREATE TABLE IF NOT EXISTS auth_attempts(ts REAL,ip TEXT);
         ''')
-        for k,v in {'cash':INITIAL,'status':'running','model':'pending','phase':'Connecting','last_cycle':0,'last_error':'','last_stream':0,'collection_error':'','last_reflection':'','strategy':'AI choosing strategy','strategy_why':'Awaiting the next autonomous decision','strategy_horizon':'Undecided','plan':None,'plan_version':0,'last_plan':'','cooldown_ai':0,'cooldown_search':0,'cooldown_alpaca':0}.items():
+        for k,v in {'cash':INITIAL,'status':'running','model':'pending','phase':'Connecting','last_cycle':0,'last_error':'','last_stream':0,'collection_error':'','start_not_before':0,'last_reflection':'','strategy':'AI choosing strategy','strategy_why':'Awaiting the next autonomous decision','strategy_horizon':'Undecided','plan':None,'plan_version':0,'last_plan':'','cooldown_ai':0,'cooldown_search':0,'cooldown_alpaca':0}.items():
             self.db.execute('INSERT OR IGNORE INTO state VALUES (?,?)',(k,json.dumps(v)))
         if not self.db.execute("SELECT 1 FROM state WHERE key='history_migrated'").fetchone():
             # Preserve genuine existing observations, choosing the final quote of each five-minute bucket.
-            self.db.execute('''INSERT OR IGNORE INTO price_history SELECT symbol,CAST(ts/300 AS INTEGER)*300,ts,bid,ask FROM (SELECT symbol,ts,bid,ask,ROW_NUMBER() OVER (PARTITION BY symbol,CAST(ts/300 AS INTEGER) ORDER BY ts DESC,id DESC) rank FROM prices WHERE ts>?) WHERE rank=1''',(now()-183*86400,))
+            self.db.execute('''INSERT OR IGNORE INTO price_history SELECT symbol,CAST(ts/300 AS INTEGER)*300,ts,bid,ask FROM (SELECT symbol,ts,bid,ask,ROW_NUMBER() OVER (PARTITION BY symbol,CAST(ts/300 AS INTEGER) ORDER BY ts DESC,id DESC) rank FROM prices WHERE ts>?) WHERE rank=1''',(now()-90*86400,))
             self.set('history_migrated',True)
         if not self.db.execute('SELECT 1 FROM equity LIMIT 1').fetchone():
             self.db.execute('INSERT INTO equity(ts,equity,cash) VALUES (?,?,?)',(now(),INITIAL,INITIAL))
@@ -84,7 +85,7 @@ class Store:
         if qty<=0:raise ValueError('Quantity must be positive')
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            if self.get('status')!='running' or not market_open:raise ValueError('Trading is closed or suspended')
+            if self.get('status')!='running' or not market_open or now()<self.get('start_not_before'):raise ValueError('Trading is closed or suspended')
             q=self.latest(symbol)
             if not q or now()-q['ts']>90:raise ValueError('No fresh quote')
             # Buy at ask + 5 bps, sell at bid - 5 bps; this is a simulation, not a brokerage fill.
@@ -141,4 +142,4 @@ class Store:
         realized=self.db.execute('SELECT COALESCE(SUM(realized),0) FROM trades').fetchone()[0]/SCALE
         stock_risks={p['symbol']:p['risk'] for p in a['holdings']}
         archive_stats=self.db.execute('SELECT COUNT(*),MIN(bucket),MAX(bucket),COUNT(DISTINCT symbol) FROM price_history').fetchone()
-        return {**a,'price_memory':{'samples':archive_stats[0],'first':archive_stats[1],'last':archive_stats[2],'symbols':archive_stats[3],'error':self.get('collection_error'),'retention_days':183,'interval_minutes':5},'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':0.55,'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}
+        return {**a,'price_memory':{'samples':archive_stats[0],'first':archive_stats[1],'last':archive_stats[2],'symbols':archive_stats[3],'error':self.get('collection_error'),'retention_days':90,'interval_minutes':5},'start_not_before':self.get('start_not_before'),'stock_risks':stock_risks,'initial':100000,'pnl':a['equity']-100000,'realized':realized,'trades':trades,'trade_count':self.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0], 'notes':self.rows('SELECT * FROM notes ORDER BY id DESC LIMIT 60'),'curve':eq,'usage':stats,'ai_budget':0.55,'status':self.get('status'),'phase':self.get('phase'),'model':self.get('model'),'strategy':self.get('strategy'),'strategy_why':self.get('strategy_why'),'strategy_horizon':self.get('strategy_horizon'),'plan':self.get('plan'),'provider_limits':{p:self.get('limits_'+p) if self.db.execute('SELECT 1 FROM state WHERE key=?',('limits_'+p,)).fetchone() else {} for p in ('ai','search','alpaca')},'ai_local_budget_available_at':self.db.execute("SELECT MIN(ts)+86400 FROM requests WHERE provider='ai' AND ts>?",(now()-86400,)).fetchone()[0],'last_cycle':self.get('last_cycle'),'last_stream':self.get('last_stream'),'last_error':self.get('last_error'),'as_of':now(),'simulation':True,'feed':'IEX · up to 30 symbols'}
