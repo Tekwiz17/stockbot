@@ -168,7 +168,7 @@ class Engine:
             try:
                 ip,op,request=map(float,(p['prompt'],p['completion'],p.get('request',0)))
                 if any(not math.isfinite(v) or v<0 for v in (ip,op,request)):continue
-                # Worst-case input byte bound is 12,000; reserve for output, message overhead and a 20% margin.
+                # Actual prompt-size reservations are calculated in decide before every call.
                 # Explicit routing caps cover provider variation observed in a live completion.
                 if ip>0.22e-6 or op>2.7e-6 or request>0:continue
                 ip,op=0.22e-6,2.7e-6
@@ -200,43 +200,29 @@ class Engine:
         held={p['symbol'] for p in holdings}
         quotes.sort(key=lambda q:(q['symbol'] not in held,-abs(q['momentum_30m'] or (q['history'].get('1d',0)/100))),reverse=False)
         scanned=len(quotes)
-        quotes=[q for i,q in enumerate(quotes) if i<30 or q['symbol'] in held]
         outcomes=self.s.rows("SELECT symbol,COUNT(*) exits,ROUND(SUM(realized)/1000000.0,2) pnl_usd FROM trades WHERE side='sell' GROUP BY symbol ORDER BY SUM(realized) LIMIT 12")
         recent=self.s.rows('SELECT symbol,side,reason,realized/1000000.0 pnl_usd FROM trades ORDER BY id DESC LIMIT 8')
         notes=self.s.rows('SELECT kind,body FROM notes ORDER BY id DESC LIMIT 4')
-        c={'scanner':{'watchlist_size':len(SYMBOLS),'available_quotes':scanned,'selected_for_AI':len(quotes),'selection':'holdings then strongest observed absolute momentum; all observations remain queryable'},'trade_count':self.s.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0],'data_capabilities':{'quotes':'120-name watchlist plus holdings and discoveries; IEX prices, historical returns in percent; coverage is stated','bars':'Observed IEX one-minute OHLCV only; no 50-day baseline','unavailable':['ES futures','VIX','RS ratings','50/200-day averages','consolidated volume']},'mode':'market open' if opened else 'closed market review','time':datetime.now(NY).isoformat(),'cash_usd':a['cash']/SCALE,'equity_usd':a['equity']/SCALE,'strategy':self.s.get('strategy'),'saved_plan':self.s.get('plan'),'positions':holdings,'quotes':quotes,'realized_outcomes':outcomes,'recent_trades':recent,'lessons':notes,'news':news}
+        c={'scanner':{'watchlist_size':len(SYMBOLS),'available_quotes':scanned,'selected_for_AI':len(quotes),'selection':'all available watchlist and held quotes, holdings first then observed absolute momentum'},'trade_count':self.s.db.execute('SELECT COUNT(*) FROM trades').fetchone()[0],'data_capabilities':{'quotes':'120-name watchlist plus holdings and discoveries; IEX prices, historical returns in percent; coverage is stated','bars':'Observed IEX one-minute OHLCV only; no 50-day baseline','unavailable':['ES futures','VIX','RS ratings','50/200-day averages','consolidated volume']},'mode':'market open' if opened else 'closed market review','time':datetime.now(NY).isoformat(),'cash_usd':a['cash']/SCALE,'equity_usd':a['equity']/SCALE,'strategy':self.s.get('strategy'),'saved_plan':self.s.get('plan'),'positions':holdings,'quotes':quotes,'realized_outcomes':outcomes,'recent_trades':recent,'lessons':notes,'news':news}
         raw=json.dumps(c,ensure_ascii=False,separators=(',',':'))
-        # Bound the complete prompt; preferentially discard old verbose narrative, never truncate JSON.
-        while len((PROMPT+raw).encode())>12000:
-            if c['lessons']:c['lessons'].pop()
-            elif c['recent_trades']:c['recent_trades'].pop()
-            elif c['news']:c['news'].pop()
-            elif c['saved_plan']:c['saved_plan']=None
-            elif any(q['minute_bars'] for q in c['quotes']):
-                for q in c['quotes']:q['minute_bars']=[]
-            elif any(len(q.get('history',{}))>2 for q in c['quotes']):
-                for q in c['quotes']:q['history']={k:v for k,v in q['history'].items() if k in ('samples','as_of','1d','5d','20d')}
-                # Drop lower-priority non-held candidates to the input bound; their history stays in SQLite.
-                if len((PROMPT+json.dumps(c,separators=(',',':'))).encode())>12000:
-                    held={p['symbol'] for p in holdings}
-                    removable=[q for q in c['quotes'] if q['symbol'] not in held]
-                    if removable:c['quotes'].remove(removable[-1])
-                    else:raise ValueError('Context exceeds safe input limit')
-            else:raise ValueError('Context exceeds safe input limit')
-            raw=json.dumps(c,ensure_ascii=False,separators=(',',':'))
         return raw
     async def decide(self,news,opened):
         m=await self.select_model();raw=self.context(news,opened)
         # Reserve the complete worst-case charge BEFORE sending. Keep it reserved even on timeouts.
         if now()<self.s.get('cooldown_ai'):raise ValueError('AI is cooling down')
-        rid,credential,key=self.reserve_ai(m['worst'])
+        # UTF-8 bytes are a conservative token upper bound, including message overhead.
+        # Charge grows with the actual prompt instead of assuming a fixed 12KB payload.
+        input_bound=len((PROMPT+raw).encode('utf-8'))+2000
+        worst=(input_bound*m['input']+1800*m['output'])*1.20
+        self.s.set('ai_context_bytes',len((PROMPT+raw).encode('utf-8')))
+        rid,credential,key=self.reserve_ai(worst)
         try:
             r=await self.http.post(AI+'/chat/completions',headers={'Authorization':'Bearer '+key},json={'provider':{'max_price':{'prompt':m['input']*1e6,'completion':m['output']*1e6,'request':0},'sort':'price'},'model':m['id'],'messages':[{'role':'system','content':PROMPT},{'role':'user','content':raw}],'max_tokens':1800,'temperature':0.65,'response_format':{'type':'json_object'},'reasoning':{'enabled':False}})
             from .limits import capture
             capture(self.s,'ai',r,now(),scope=credential)
             r.raise_for_status();data=r.json();self.s.complete(rid,'ok')
             actual=float(data.get('usage',{}).get('cost',0) or 0)
-            if not math.isfinite(actual) or actual>m['worst']:
+            if not math.isfinite(actual) or actual>worst:
                 if math.isfinite(actual):self.s.db.execute('UPDATE requests SET cost=? WHERE id=?',(actual,rid))
                 self.s.set('cooldown_ai',now()+86400)
                 raise ValueError('Provider cost exceeded reservation; AI calls suspended')

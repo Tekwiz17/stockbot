@@ -248,7 +248,7 @@ def test_55_cent_budget_and_57_completion_cap(store):
     assert store.public()['ai_budget']==.55
     assert store.public()['usage'][0]['reserved']<=.55
 
-def test_full_bar_context_stays_inside_input_budget(store):
+def test_full_watchlist_context_preserves_large_input(store):
     async def run():
         e=Engine(store)
         for symbol in SYMBOLS:
@@ -256,7 +256,9 @@ def test_full_bar_context_stays_inside_input_budget(store):
             for i in range(5):store.bar(symbol,100,102,99,101,10000,now()-60*(i+1))
         raw=e.context([],True)
         from backend.engine import PROMPT
-        assert len((PROMPT+raw).encode())<=12000
+        assert len((PROMPT+raw).encode())>12000
+        assert len(json.loads(raw)['quotes'])==len(SYMBOLS)
+        assert all(len(q['minute_bars'])==5 for q in json.loads(raw)['quotes'])
         assert json.loads(raw)['trade_count']==0
         await e.close()
     asyncio.run(run())
@@ -455,3 +457,24 @@ def test_storage_guard_pauses_prices_without_affecting_cash(store):
     store.storage_checked=now();store.storage_ok=False
     before=store.get('cash');quote(store)
     assert store.latest('NVDA') is None and store.get('cash')==before
+
+
+def test_large_context_reservation_scales_with_prompt(store,monkeypatch):
+    async def run():
+        e=Engine(store);monkeypatch.setenv('HACKCLUB_AI_KEY','large-context-test')
+        narrative='Evidence and lessons. '*3000
+        e.s.set('plan',{'summary':narrative})
+        raw=e.context([],False)
+        async def handler(req):
+            if req.url.path.endswith('/models'):
+                return httpx.Response(200,json={'data':[{'id':'qwen/qwen3-32b','pricing':{'prompt':'0.0000001','completion':'0.0000004'}}]})
+            body=json.loads(req.content)
+            assert json.loads(body['messages'][1]['content'])['saved_plan']['summary']==narrative
+            return httpx.Response(200,json={'choices':[{'message':{'content':'{"actions":[]}'}}]})
+        await e.http.aclose();e.http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await e.decide([],False)
+        from backend.engine import PROMPT
+        expected=((len((PROMPT+raw).encode())+2000)*.22e-6+1800*2.7e-6)*1.2
+        assert store.rows("SELECT cost FROM requests WHERE provider='ai'")[0]['cost']==pytest.approx(expected)
+        await e.close()
+    asyncio.run(run())
